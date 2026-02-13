@@ -1,0 +1,308 @@
+from google.colab import files
+import pandas as pd
+import io
+import requests
+from tqdm.notebook import tqdm
+from urllib.parse import urlparse
+from datetime import datetime
+import math
+import re
+import time
+
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
+
+
+# -----------------------------
+# Upload file
+# -----------------------------
+uploaded = files.upload()
+file_name = next(iter(uploaded))
+
+
+# -----------------------------
+# Read file
+# -----------------------------
+df = pd.read_csv(
+    io.StringIO(uploaded[file_name].decode("utf-8")),
+    delimiter="\t"
+)
+
+tqdm.pandas()
+
+
+# -----------------------------
+# Get filename base from U2
+# -----------------------------
+base_name = str(df.iloc[1, 20])
+
+base_name = re.sub(r'[\\/*?:"<>|]', '', base_name)
+base_name = base_name.strip().replace(" ", "_")
+
+if not base_name or base_name.lower() == "nan":
+    base_name = "linkschecked"
+
+print("Base filename:", base_name)
+
+
+# -----------------------------
+# Known restricted publishers
+# -----------------------------
+restricted_domains = [
+    "jstor.org",
+    "sciencedirect.com",
+    "elsevier.com",
+    "springer.com",
+    "springerlink.com",
+    "wiley.com",
+    "onlinelibrary.wiley.com",
+    "proquest.com",
+    "ebscohost.com",
+    "lexisnexis.com",
+    "nature.com",
+    "tandfonline.com",
+    "sagepub.com",
+    "oxfordjournals.org",
+    "cambridge.org"
+]
+
+
+# -----------------------------
+# Link checker
+# -----------------------------
+def check_link(url):
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.google.com/"
+    }
+
+    try:
+
+        # Try HEAD first
+        response = requests.head(
+            url,
+            allow_redirects=True,
+            timeout=10,
+            headers=headers
+        )
+
+        # Retry with GET if blocked
+        if response.status_code in [403, 405] or response.status_code >= 400:
+
+            response = requests.get(
+                url,
+                allow_redirects=True,
+                timeout=12,
+                headers=headers
+            )
+
+
+        status = response.status_code
+        final_url = response.url
+        domain = urlparse(final_url).netloc.lower()
+        text = response.text.lower()
+
+
+        # -----------------------------
+        # Polite delay
+        # -----------------------------
+        time.sleep(0.3)
+
+
+        # -----------------------------
+        # Parking keywords
+        # -----------------------------
+        selling_keywords = [
+            "domain for sale",
+            "buy this domain",
+            "parked domain",
+            "domain parked",
+            "coming soon",
+            "under construction",
+            "future home of",
+            "sedo",
+            "godaddy",
+            "namecheap",
+            "afternic",
+            "hugedomains",
+            "dan.com",
+            "bodis",
+            "parkingcrew"
+        ]
+
+
+        # -----------------------------
+        # Soft error keywords
+        # -----------------------------
+        error_keywords = [
+            "page not found",
+            "404 error",
+            "file not found",
+            "doesn't exist",
+            "no longer available",
+            "temporarily unavailable",
+            "server error",
+            "service unavailable",
+            "bad gateway"
+        ]
+
+
+        # -----------------------------
+        # Smart 403 handling
+        # -----------------------------
+        if status == 403:
+
+            if any(d in domain for d in restricted_domains):
+                return "Restricted Access (Likely OK)"
+
+            return "403 Forbidden"
+
+
+        # -----------------------------
+        # HTTP errors
+        # -----------------------------
+        if status == 404:
+            return "404 Not Found"
+
+        if status == 401:
+            return "401 Unauthorized"
+
+        if status == 500:
+            return "500 Server Error"
+
+        if status == 502:
+            return "502 Bad Gateway"
+
+        if status == 503:
+            return "503 Service Unavailable"
+
+        if status >= 400:
+            return f"HTTP {status}"
+
+
+        # -----------------------------
+        # Domain parking
+        # -----------------------------
+        if any(k in domain for k in selling_keywords):
+            return "Domain Parking (Domain)"
+
+        if any(k in text for k in selling_keywords):
+            return "Domain Parking (Content)"
+
+
+        # -----------------------------
+        # Soft 404
+        # -----------------------------
+        if any(k in text for k in error_keywords):
+            return "Soft 404 / Broken Page"
+
+
+        return "OK"
+
+
+    except requests.exceptions.Timeout:
+        return "Timeout"
+
+    except requests.exceptions.SSLError:
+        return "SSL Error"
+
+    except requests.exceptions.ConnectionError:
+        return "Connection Failed"
+
+    except requests.exceptions.RequestException:
+        return "Request Error"
+
+
+# -----------------------------
+# Excel formatting
+# -----------------------------
+def format_excel(filename, status_col_index):
+
+    wb = load_workbook(filename)
+    ws = wb.active
+
+
+    green_fill = PatternFill(
+        start_color="C6EFCE",
+        end_color="C6EFCE",
+        fill_type="solid"
+    )
+
+    red_fill = PatternFill(
+        start_color="FFC7CE",
+        end_color="FFC7CE",
+        fill_type="solid"
+    )
+
+
+    for row in range(2, ws.max_row + 1):
+
+        cell = ws.cell(row=row, column=status_col_index)
+        value = str(cell.value)
+
+        if value == "OK" or "Likely OK" in value:
+            cell.fill = green_fill
+        else:
+            cell.fill = red_fill
+
+
+    wb.save(filename)
+
+
+# -----------------------------
+# Chunking
+# -----------------------------
+chunk_size = 200
+total_rows = len(df)
+num_chunks = math.ceil(total_rows / chunk_size)
+
+today = datetime.today().strftime('%Y-%m-%d')
+
+
+# -----------------------------
+# Process chunks
+# -----------------------------
+for i in range(num_chunks):
+
+    start = i * chunk_size
+    end = min(start + chunk_size, total_rows)
+
+    chunk_df = df.iloc[start:end].copy()
+
+    print(f"Processing records {start + 1}–{end} of {total_rows}")
+
+
+    status_series = chunk_df['title_url'].progress_apply(check_link)
+
+
+    # Insert after column J (index 9 → position 10)
+    chunk_df.insert(
+        loc=10,
+        column="Link Status",
+        value=status_series
+    )
+
+
+    output_filename = (
+        f"{base_name}_{today}_part{str(i + 1).zfill(3)}.xlsx"
+    )
+
+
+    chunk_df.to_excel(output_filename, index=False)
+
+
+    # Excel column K = 11
+    format_excel(output_filename, 11)
+
+
+    print(f"Saved: {output_filename}")
+
+
+print("✅ All chunks processed.")
+print("📁 Download from Colab Files panel when ready.")
