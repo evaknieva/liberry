@@ -1,0 +1,352 @@
+# ============================================================
+#  KBART Filter + Link Checker  |  Google Colab
+#  Upload your KBART to Google Drive prior to running code
+#  Edit paths for your specific file names + collection names in STEP 3
+# -----------------------------------------------------------------
+#  This code uses a checkpoint. If the process gets interrupted, 
+#  just rerun the code from the top. It will start again where it left off.
+# ============================================================
+
+# ── STEP 1 ── Install dependencies
+# ─────────────────────────────────
+get_ipython().system('pip install openpyxl requests tqdm -q')
+
+
+# ── STEP 2 ── Mount Google Drive
+# ────────────────────────────────
+from google.colab import drive
+drive.mount('/content/drive')
+
+
+# ── STEP 3 ── Configuration  ← edit paths/settings here
+# ───────────────────────────────────────────────────────
+import os
+
+# Path to your KBART file in Drive
+KBART_PATH = '/content/drive/MyDrive/KBART_01152026.txt'
+
+# Where to save the output
+OUTPUT_PATH = '/content/drive/MyDrive/KBART_filtered_link_checked.xlsx'
+
+# Collections to keep (column U = oclc_collection_name)
+TARGET_COLLECTIONS = [
+    'National Academies Press open access monographs',
+    'Freely Accessible Science Journals',
+    'WVU Open Access',
+    'WVU Latindex',
+    'WVU Freely Accessible Journals',
+    'WVU Free Medical Journals',
+    'WVU Free Full-Text Journals in Chemistry'
+    'Directory of Open Access Journals (All titles)',
+]
+
+# Link-checker tuning
+REQUEST_TIMEOUT   = 15      # seconds per request
+DELAY_BETWEEN     = 1.5     # seconds between requests (reduces bot detection)
+MAX_RETRIES       = 2       # retries on connection errors
+WORKERS           = 5       # concurrent threads (keep low to avoid blocks)
+
+# Checkpoint settings  (the live .xlsx IS the checkpoint — no separate file needed)
+CHECKPOINT_EVERY  = 50      # re-save the .xlsx every N completed URLs
+
+
+# ── STEP 4 ── Filter KBART file
+# ──────────────────────────────
+import pandas as pd
+
+print('Reading KBART file…')
+df = pd.read_csv(
+    KBART_PATH,
+    sep='\t',
+    dtype=str,
+    encoding='utf-8',
+    on_bad_lines='skip'
+)
+
+print(f'  Total rows loaded : {len(df):,}')
+
+# Column U is index 20 (0-based); use header name for safety
+col_u = df.columns[20]   # 'oclc_collection_name'
+print(f'  Filtering on column: "{col_u}"')
+
+df_filtered = df[df[col_u].isin(TARGET_COLLECTIONS)].copy()
+df_filtered.reset_index(drop=True, inplace=True)
+print(f'  Rows after filter : {len(df_filtered):,}')
+
+
+# ── STEP 5 ── Insert "link status" column after column J (index 9)
+# ─────────────────────────────────────────────────────────────────
+col_j_name   = df_filtered.columns[9]   # 'title_url'
+insert_pos   = 10                        # right after column J (0-based index 9)
+
+df_filtered.insert(insert_pos, 'link_status', '')
+print(f'  "link_status" inserted after "{col_j_name}"')
+
+
+# ── STEP 6 ── Link checker  (live .xlsx checkpoint — resumes automatically)
+# ───────────────────────────────────────────────────────────────────────────
+import requests
+import time
+import random
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
+
+# Realistic rotating user-agent pool
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2) AppleWebKit/605.1.15 '
+    '(KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
+]
+
+# Phrases that indicate a domain-parking / for-sale page
+PARKED_PATTERNS = re.compile(
+    r'domain\s*(is\s*)?(for\s*sale|available|has\s*expired)|'
+    r'buy\s*this\s*domain|this\s*site\s*is\s*for\s*sale|'
+    r'godaddy|namecheap|sedo\.com|dan\.com|hugedomains|'
+    r'domain\s*parking|parked\s*by|under\s*construction',
+    re.IGNORECASE
+)
+
+
+def check_url(url: str) -> str:
+    """Return a status string for a single URL."""
+    url = url.strip()
+    if not url:
+        return 'No URL'
+
+    headers = {
+        'User-Agent': random.choice(USER_AGENTS),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+    }
+
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            resp = requests.head(
+                url, headers=headers, timeout=REQUEST_TIMEOUT,
+                allow_redirects=True, verify=True
+            )
+
+            if resp.status_code in (405, 501):
+                resp = requests.get(
+                    url, headers=headers, timeout=REQUEST_TIMEOUT,
+                    allow_redirects=True, verify=True, stream=True
+                )
+                content = next(resp.iter_content(4096), b'')
+            else:
+                if resp.status_code == 200:
+                    resp2 = requests.get(
+                        url, headers=headers, timeout=REQUEST_TIMEOUT,
+                        allow_redirects=True, verify=True, stream=True
+                    )
+                    content = next(resp2.iter_content(4096), b'')
+                    resp.status_code = resp2.status_code
+                else:
+                    content = b''
+
+            code = resp.status_code
+
+            if code == 200:
+                try:
+                    text_snippet = content.decode('utf-8', errors='ignore')
+                except Exception:
+                    text_snippet = ''
+                if PARKED_PATTERNS.search(text_snippet):
+                    return 'Domain for sale / parked'
+                return 'OK'
+            elif code in (301, 302):
+                return f'Redirect ({code}) – check final destination'
+            elif code == 403:
+                return '403 – Possible bot block (access forbidden)'
+            elif code == 404:
+                return '404 – Page not found'
+            elif code == 410:
+                return '410 – Gone (resource permanently removed)'
+            elif code == 429:
+                return '429 – Rate limited (too many requests)'
+            elif code == 500:
+                return '500 – Internal server error'
+            elif code == 502:
+                return '502 – Bad gateway'
+            elif code == 503:
+                return '503 – Service unavailable'
+            elif code == 504:
+                return '504 – Gateway timeout'
+            else:
+                return f'HTTP {code}'
+
+        except requests.exceptions.SSLError:
+            return 'SSL certificate error'
+        except requests.exceptions.ConnectionError:
+            if attempt < MAX_RETRIES:
+                time.sleep(2 ** attempt)
+                continue
+            return 'Connection error (site unreachable)'
+        except requests.exceptions.Timeout:
+            if attempt < MAX_RETRIES:
+                continue
+            return f'Timeout after {REQUEST_TIMEOUT}s'
+        except requests.exceptions.TooManyRedirects:
+            return 'Too many redirects'
+        except Exception as e:
+            return f'Error: {type(e).__name__}'
+
+    return 'Connection error (max retries exceeded)'
+
+
+def check_with_delay(args):
+    idx, url = args
+    time.sleep(DELAY_BETWEEN + random.uniform(0, 0.5))
+    return idx, check_url(url)
+
+
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.utils import get_column_letter
+
+# Colours (defined here so save_xlsx can use them during checkpoints too)
+GREEN_FILL  = PatternFill('solid', start_color='C6EFCE', end_color='C6EFCE')
+RED_FILL    = PatternFill('solid', start_color='FFC7CE', end_color='FFC7CE')
+YELLOW_FILL = PatternFill('solid', start_color='FFEB9C', end_color='FFEB9C')
+HEADER_FILL = PatternFill('solid', start_color='4472C4', end_color='4472C4')
+HEADER_FONT = Font(bold=True, color='FFFFFF', name='Arial', size=10)
+BODY_FONT   = Font(name='Arial', size=10)
+
+
+def save_xlsx(df_to_write: pd.DataFrame, path: str, is_checkpoint: bool = False):
+    """Write df_to_write to a formatted .xlsx file.
+    During checkpoints only checked rows (link_status not empty) are included."""
+    if is_checkpoint:
+        df_out = df_to_write[df_to_write['link_status'] != ''].copy()
+    else:
+        df_out = df_to_write.copy()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'Filtered KBART'
+
+    col_headers = list(df_out.columns)
+    ls_col_idx  = col_headers.index('link_status') + 1   # 1-based
+
+    # Header row
+    for c, h in enumerate(col_headers, start=1):
+        cell = ws.cell(row=1, column=c, value=h)
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    ws.row_dimensions[1].height = 30
+
+    # Data rows
+    for r, row in enumerate(df_out.itertuples(index=False), start=2):
+        for c, val in enumerate(row, start=1):
+            cell = ws.cell(row=r, column=c, value=val)
+            cell.font = BODY_FONT
+            cell.alignment = Alignment(vertical='top', wrap_text=False)
+
+        status_val  = row[ls_col_idx - 1]   # tuple is 0-based
+        status_cell = ws.cell(row=r, column=ls_col_idx)
+        if status_val == 'OK':
+            status_cell.fill = GREEN_FILL
+        elif status_val == 'No URL':
+            status_cell.fill = YELLOW_FILL
+        elif status_val != '':
+            status_cell.fill = RED_FILL
+
+    # Column widths
+    for c, col_cells in enumerate(ws.columns, start=1):
+        max_len = max((len(str(cell.value)) for cell in col_cells if cell.value), default=10)
+        ws.column_dimensions[get_column_letter(c)].width = min(max_len + 2, 60)
+
+    ws.freeze_panes = 'A2'
+    wb.save(path)
+
+
+def load_checkpoint_from_xlsx() -> dict:
+    """
+    If OUTPUT_PATH already exists, read back any link_status values already saved.
+    Returns a dict of {row_index: status} for rows that were already checked.
+    """
+    if not os.path.exists(OUTPUT_PATH):
+        print('  No checkpoint found — starting fresh.')
+        return {}
+    try:
+        existing = pd.read_excel(OUTPUT_PATH, dtype=str)
+        if 'link_status' not in existing.columns:
+            print('  Existing file has no link_status column — starting fresh.')
+            return {}
+        # Match rows back by position (row order is preserved from df_filtered)
+        prior = {}
+        for i, val in enumerate(existing['link_status']):
+            if pd.notna(val) and str(val).strip() != '':
+                prior[i] = str(val).strip()
+        print(f'  ✅ Checkpoint found in existing .xlsx — '
+              f'resuming from {len(prior):,} already-checked rows.')
+        return prior
+    except Exception as e:
+        print(f'  Could not read checkpoint from existing file ({e}) — starting fresh.')
+        return {}
+
+
+# ── Load prior results from the .xlsx if it exists ──
+results = load_checkpoint_from_xlsx()
+
+url_col   = df_filtered.columns[9]   # column J (title_url)
+all_items = [
+    (i, str(df_filtered.at[i, url_col]) if pd.notna(df_filtered.at[i, url_col]) else '')
+    for i in range(len(df_filtered))
+]
+
+# Pre-fill any already-known statuses into df_filtered
+for idx, status in results.items():
+    df_filtered.at[idx, 'link_status'] = status
+
+# Only check rows we don't have a result for yet
+work_items = [(i, url) for i, url in all_items if i not in results]
+
+print(f'\nTotal URLs   : {len(all_items):,}')
+print(f'Already done : {len(results):,}')
+print(f'Remaining    : {len(work_items):,}')
+print(f'Workers      : {WORKERS}  |  Delay: ~{DELAY_BETWEEN}s  |  '
+      f'Checkpoint every: {CHECKPOINT_EVERY} URLs\n')
+
+if not work_items:
+    print('All URLs already checked! Skipping straight to final Excel save.')
+else:
+    completed_since_save = 0
+
+    with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+        futures = {executor.submit(check_with_delay, item): item[0] for item in work_items}
+        with tqdm(total=len(all_items), initial=len(results), unit='URL',
+                  desc='Checking links') as pbar:
+            for future in as_completed(futures):
+                idx, status = future.result()
+                results[idx]                    = status
+                df_filtered.at[idx, 'link_status'] = status
+                completed_since_save += 1
+                pbar.update(1)
+
+                if completed_since_save >= CHECKPOINT_EVERY:
+                    # Save only checked rows so far — fully formatted, openable in Excel
+                    save_xlsx(df_filtered, OUTPUT_PATH, is_checkpoint=True)
+                    completed_since_save = 0
+
+ok_count    = sum(1 for s in results.values() if s == 'OK')
+nourl_count = sum(1 for s in results.values() if s == 'No URL')
+err_count   = len(results) - ok_count - nourl_count
+print(f'\nSummary →  OK: {ok_count:,}  |  No URL: {nourl_count:,}  |  Errors/Flags: {err_count:,}')
+
+
+# ── STEP 7 ── Write final .xlsx (all rows, fully checked)
+# ─────────────────────────────────────────────────────────
+save_xlsx(df_filtered, OUTPUT_PATH, is_checkpoint=False)
+print(f'\n✅  Final file saved to: {OUTPUT_PATH}')
+print(f'    Rows : {len(df_filtered):,}')
+print(f'    Cols : {len(df_filtered.columns)}')
