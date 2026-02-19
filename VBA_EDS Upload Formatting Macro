@@ -1,0 +1,181 @@
+#This VBA code is an Excel macro that formats standard KBART for upload into EDS Local Collections
+
+Sub Journals_EDS_Upload()
+    Dim wsOriginal As Worksheet
+    Set wsOriginal = ActiveSheet
+
+    ' Capture export name from U2 BEFORE anything changes it
+    Dim exportName As String
+    Dim baseName As String
+    baseName = Trim(wsOriginal.Range("U2").Value)
+    If baseName = "" Then
+        baseName = "ExportedData"
+    Else
+        baseName = Replace(baseName, " ", "_")
+    End If
+    exportName = baseName & "_" & Format(Date, "mmddyyyy") & ".txt"
+
+    ' Delete columns E:F
+    Columns("E:F").Delete Shift:=xlToLeft
+    ' Delete columns F:X (after shift, these are the new F:X)
+    Columns("F:X").Delete Shift:=xlToLeft
+
+    ' Find the last row in column E
+    Dim lastRow As Long
+    lastRow = Cells(Rows.Count, "E").End(xlUp).row
+
+    ' Format date_first_issue_online
+    Range("F2").Formula = "=IF(D2="""","""", IF(ISNUMBER(D2), TEXT(D2, ""yyyymmdd""), IF(LEN(D2)=4, D2&""0101"", IF(LEN(D2)=7, LEFT(D2,4) & RIGHT(D2,2) & ""01"", IF(LEN(D2)=10, SUBSTITUTE(D2,""-"",""""), TEXT(DATE(YEAR(D2), MONTH(D2), DAY(D2)), ""yyyymmdd""))))))"
+    Range("F2:F" & lastRow).FillDown
+
+    ' Format date_last_issue_online
+    Range("G2").Formula = "=IF(E2="""","""", IF(ISNUMBER(E2), TEXT(E2, ""yyyymmdd""), IF(LEN(E2)=4, E2&""0101"", IF(LEN(E2)=7, LEFT(E2,4) & RIGHT(E2,2) & ""01"", IF(LEN(E2)=10, SUBSTITUTE(E2,""-"",""""), TEXT(DATE(YEAR(E2), MONTH(E2), DAY(E2)), ""yyyymmdd""))))))"
+    Range("G2:G" & lastRow).FillDown
+
+    ' Label headers
+    Range("F1").Value = "date_first_issue_online"
+    Range("G1").Value = "date_last_issue_online"
+
+    ' Paste values only
+    Range("F:F").Copy: Range("D:D").PasteSpecial Paste:=xlPasteValues
+    Application.Wait (Now + TimeValue("0:00:1"))
+    Range("G:G").Copy: Range("E:E").PasteSpecial Paste:=xlPasteValues
+    Application.CutCopyMode = False
+
+    ' Convert D and E to general format
+    Columns("D:E").NumberFormat = "General"
+    Columns("D:E").Value = Columns("D:E").Value
+    Application.Wait (Now + TimeValue("0:00:1"))
+
+    ' Delete F and G (temp formulas)
+    Columns("F:G").Delete Shift:=xlToLeft
+
+    ' Set up new sheet
+    Dim wsNew As Worksheet
+    Set wsNew = ActiveWorkbook.Sheets.Add
+
+    ' Name new sheet with today's date
+    Dim todayName As String
+    todayName = "CopiedData_" & Format(Date, "yyyymmdd")
+    On Error Resume Next
+    wsNew.Name = todayName
+    On Error GoTo 0
+
+    ' Delete print_identifier (column B in the original)
+    wsOriginal.Columns("B").Delete Shift:=xlToLeft
+
+    ' Remove rows where all four export fields are blank
+    Dim lastRowB As Long, i As Long
+    lastRowB = wsOriginal.Cells(Rows.Count, "A").End(xlUp).row
+    For i = lastRowB To 2 Step -1
+        If WorksheetFunction.CountA(wsOriginal.Range("A" & i & ":D" & i)) = 0 Then
+            wsOriginal.Rows(i).Delete
+        End If
+    Next i
+
+    ' Move remaining data (excluding header) to new sheet
+    Dim lastRowOriginal As Long, lastRowCopied As Long
+    lastRowOriginal = wsOriginal.Cells(Rows.Count, "A").End(xlUp).row
+    lastRowCopied = wsNew.Cells(Rows.Count, 1).End(xlUp).row
+    If lastRowOriginal > 1 Then
+        wsOriginal.Rows("2:" & lastRowOriginal).Copy
+        wsNew.Cells(lastRowCopied + 1, 1).PasteSpecial Paste:=xlPasteValues
+        wsOriginal.Rows("2:" & lastRowOriginal).Delete
+    End If
+    Application.CutCopyMode = False
+
+    ' Copy headers to new sheet
+    wsNew.Range("A1").Value = "publication_title"
+    wsNew.Range("B1").Value = "online_identifier"
+    wsNew.Range("C1").Value = "date_first_issue_online"
+    wsNew.Range("D1").Value = "date_last_issue_online"
+
+    ' ==== Swap columns A and B safely ====
+    Dim lastRowReorder As Long
+    lastRowReorder = wsNew.Cells(wsNew.Rows.Count, "A").End(xlUp).row
+
+    ' Insert temp column at C
+    wsNew.Columns("C").Insert Shift:=xlToRight
+
+    ' Copy column A to temp column C
+    wsNew.Range("A1:A" & lastRowReorder).Copy Destination:=wsNew.Range("C1:C" & lastRowReorder)
+
+    ' Copy column B to column A
+    wsNew.Range("B1:B" & lastRowReorder).Copy Destination:=wsNew.Range("A1:A" & lastRowReorder)
+
+    ' Copy temp column C to column B
+    wsNew.Range("C1:C" & lastRowReorder).Copy Destination:=wsNew.Range("B1:B" & lastRowReorder)
+
+    ' Delete temp column C
+    wsNew.Columns("C").Delete
+    ' ==== End swap ====
+
+    ' Delete original sheet
+    Application.DisplayAlerts = False
+    wsOriginal.Delete
+    Application.DisplayAlerts = True
+
+    ' Delete header row from new sheet (after reorder)
+    wsNew.Rows(1).Delete
+
+    ' Remove first column (print_identifier) before export
+    wsNew.Columns(1).Delete Shift:=xlToLeft
+
+    ' === Export to UTF-8 text file WITHOUT BOM ===
+    Dim filePath As String
+    Dim lastCol As Long
+    Dim rng As Range, rowRange As Range
+    Dim cell As Range
+    Dim lineText As String
+    Dim allText As String
+
+    filePath = Environ("USERPROFILE") & "\Downloads\" & exportName
+
+    With wsNew
+        lastRow = .Cells(.Rows.Count, 1).End(xlUp).row
+        lastCol = .Cells(1, .Columns.Count).End(xlToLeft).Column
+        Set rng = .Range(.Cells(1, 1), .Cells(lastRow, lastCol))
+    End With
+
+    allText = ""
+    For Each rowRange In rng.Rows
+        lineText = ""
+        For Each cell In rowRange.Cells
+            lineText = lineText & cell.Value & vbTab
+        Next cell
+        If Len(lineText) > 0 Then lineText = Left(lineText, Len(lineText) - 1)
+        allText = allText & lineText & vbCrLf
+    Next rowRange
+
+    ' Step 1: Write text to a text stream with UTF-8 encoding (with BOM)
+    Dim textStream As Object
+    Set textStream = CreateObject("ADODB.Stream")
+    With textStream
+        .Charset = "utf-8"
+        .Open
+        .WriteText allText
+        .Position = 0
+    End With
+
+    ' Step 2: Copy binary contents, skipping BOM (first 3 bytes)
+    Dim binaryStream As Object
+    Set binaryStream = CreateObject("ADODB.Stream")
+    With binaryStream
+        .Type = 1 ' adTypeBinary
+        .Open
+        textStream.Type = 1
+        textStream.Position = 3 ' skip BOM
+        .Write textStream.Read
+        .SaveToFile filePath, 2
+        .Close
+    End With
+
+    textStream.Close
+    Set textStream = Nothing
+    Set binaryStream = Nothing
+
+
+
+    MsgBox "File saved as UTF-8: " & filePath, vbInformation, "Export Complete"
+End Sub
+
